@@ -1,88 +1,43 @@
-
 import { useState, useEffect } from 'react';
-import { useAuth } from '../context/AuthContext';
+import { supabase } from '../lib/supabase';
+import { useAuth } from '../contexts/AuthContext';
 
 export interface Notification {
   id: string;
   title: string;
   message: string;
-  type: 'booking_reminder' | 'extension_reminder' | 'owner_notification' | 'system';
-  time: string;
-  unread: boolean;
-  actionUrl?: string;
-  createdAt: string;
+  type: 'booking' | 'payment' | 'review' | 'system' | 'extension';
+  is_read: boolean;
+  action_url?: string;
+  metadata: Record<string, any>;
+  created_at: string;
+  expires_at?: string;
 }
 
 export const useNotifications = () => {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [loading, setLoading] = useState(true);
-  const { user, profile } = useAuth();
+  const [unreadCount, setUnreadCount] = useState(0);
+  const { user } = useAuth();
 
-  // Mock notifications data - in real app this would come from Supabase
-  const mockNotifications: Notification[] = [
-    {
-      id: '1',
-      title: 'Booking Reminder',
-      message: 'Your parking session at Central Plaza starts in 30 minutes',
-      type: 'booking_reminder',
-      time: '5 min ago',
-      unread: true,
-      actionUrl: '/bookings',
-      createdAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
-    },
-    {
-      id: '2',
-      title: 'Extension Available',
-      message: 'You can extend your current parking session',
-      type: 'extension_reminder',
-      time: '15 min ago',
-      unread: true,
-      actionUrl: '/bookings',
-      createdAt: new Date(Date.now() - 15 * 60 * 1000).toISOString(),
-    },
-    {
-      id: '3',
-      title: 'New Booking',
-      message: 'Someone booked your parking spot at Downtown Mall',
-      type: 'owner_notification',
-      time: '1 hour ago',
-      unread: false,
-      actionUrl: '/admin',
-      createdAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
-    },
-    {
-      id: '4',
-      title: 'Payment Received',
-      message: 'Payment confirmed for booking #12345',
-      type: 'system',
-      time: '2 hours ago',
-      unread: false,
-      createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-    },
-  ];
+  const fetchNotifications = async () => {
+    if (!user) return;
 
-  const loadNotifications = async () => {
-    setLoading(true);
     try {
-      // Simulate API call delay
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      // Filter notifications based on user type
-      let filteredNotifications = mockNotifications;
-      
-      if (profile?.user_type === 'guest') {
-        filteredNotifications = mockNotifications.filter(n => 
-          n.type === 'booking_reminder' || n.type === 'extension_reminder' || n.type === 'system'
-        );
-      } else if (profile?.user_type === 'host') {
-        filteredNotifications = mockNotifications.filter(n => 
-          n.type === 'owner_notification' || n.type === 'system'
-        );
-      }
-      
-      setNotifications(filteredNotifications);
+      const { data, error } = await supabase
+        .from('notifications')
+        .select('*')
+        .eq('user_id', user.id)
+        .or('expires_at.is.null,expires_at.gt.now()')
+        .order('created_at', { ascending: false })
+        .limit(50);
+
+      if (error) throw error;
+
+      setNotifications(data || []);
+      setUnreadCount((data || []).filter(n => !n.is_read).length);
     } catch (error) {
-      console.error('Error loading notifications:', error);
+      console.error('Error fetching notifications:', error);
     } finally {
       setLoading(false);
     }
@@ -90,44 +45,90 @@ export const useNotifications = () => {
 
   const markAsRead = async (notificationId: string) => {
     try {
-      // In real app, this would make an API call to mark as read
-      setNotifications(prev => 
-        prev.map(notification => 
-          notification.id === notificationId 
-            ? { ...notification, unread: false }
-            : notification
-        )
+      const { error } = await supabase
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('id', notificationId);
+
+      if (error) throw error;
+
+      setNotifications(prev =>
+        prev.map(n => n.id === notificationId ? { ...n, is_read: true } : n)
       );
+      setUnreadCount(prev => Math.max(0, prev - 1));
     } catch (error) {
       console.error('Error marking notification as read:', error);
     }
   };
 
   const markAllAsRead = async () => {
+    if (!user) return;
+
     try {
-      // In real app, this would make an API call to mark all as read
-      setNotifications(prev => 
-        prev.map(notification => ({ ...notification, unread: false }))
+      const { error } = await supabase
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('user_id', user.id)
+        .eq('is_read', false);
+
+      if (error) throw error;
+
+      setNotifications(prev =>
+        prev.map(n => ({ ...n, is_read: true }))
       );
+      setUnreadCount(0);
     } catch (error) {
       console.error('Error marking all notifications as read:', error);
     }
   };
 
-  const unreadCount = notifications.filter(n => n.unread).length;
+  const deleteNotification = async (notificationId: string) => {
+    try {
+      const { error } = await supabase
+        .from('notifications')
+        .delete()
+        .eq('id', notificationId);
+
+      if (error) throw error;
+
+      setNotifications(prev => prev.filter(n => n.id !== notificationId));
+    } catch (error) {
+      console.error('Error deleting notification:', error);
+    }
+  };
 
   useEffect(() => {
-    if (user) {
-      loadNotifications();
-    }
-  }, [user, profile?.user_type]);
+    fetchNotifications();
+
+    // Set up real-time subscription for notifications
+    const subscription = supabase
+      .channel('notifications')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'notifications',
+          filter: `user_id=eq.${user?.id}`,
+        },
+        () => {
+          fetchNotifications();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [user]);
 
   return {
     notifications,
-    unreadCount,
     loading,
+    unreadCount,
     markAsRead,
     markAllAsRead,
-    loadNotifications,
+    deleteNotification,
+    refetch: fetchNotifications,
   };
 };
